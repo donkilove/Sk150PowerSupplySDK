@@ -1,0 +1,43 @@
+name: publish-nuget
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-test-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore Sk150PowerSupply.sln
+
+      - name: Build
+        run: dotnet build Sk150PowerSupply.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test Sk150PowerSupply.sln --configuration Release --no-build --logger "trx;LogFileName=test-results.trx"
+
+      - name: Pack
+        run: dotnet pack src/Sk150PowerSupply/Sk150PowerSupply.csproj --configuration Release --no-build --output ./artifacts
+
+      - name: Push to GitHub Packages
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dotnet nuget push "./artifacts/*.nupkg" \
+            --source "https://nuget.pkg.github.com/donkilove/index.json" \
+            --api-key "$NUGET_AUTH_TOKEN" \
+            --skip-duplicate
