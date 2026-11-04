@@ -1,28 +1,71 @@
-using System.IO.Ports;
-
 namespace Sk150PowerSupply;
 
 /// <summary>
 /// MODBUS RTU channel over a serial port (USB-to-TTL adapter or a module's built-in bridge).
 /// </summary>
 /// <remarks>
+/// <para>
 /// Requests are serialised by an internal gate, each request is preceded by the configured
 /// inter-frame silence, and responses are read until the expected length arrives or the line goes
 /// idle. Framing and timeout failures are retried <see cref="Sk150Options.Retries"/> times;
 /// MODBUS exception responses are never retried.
+/// </para>
+/// <para>
+/// The channel talks to an <see cref="ISerialPort"/>, not to <c>System.IO.Ports.SerialPort</c>
+/// directly, so a host application (or a test) can supply its own port implementation while
+/// keeping this framing, polling and retry logic unchanged.
+/// </para>
 /// </remarks>
 public sealed class SerialRegisterChannel : IRegisterChannel
 {
     private readonly Sk150Options _options;
-    private readonly SerialPort _port;
+    private readonly ISerialPort _port;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _disposed;
 
     /// <summary>Creates a channel from a fully populated options object.</summary>
     /// <exception cref="ArgumentException">No port name was supplied.</exception>
     public SerialRegisterChannel(Sk150Options options)
+        : this(options, options => new SystemSerialPort(options.PortName!, options.BaudRate))
+    {
+    }
+
+    /// <summary>
+    /// Creates a channel over a caller-supplied port, taking link behaviour (slave address,
+    /// timeouts, retries) from <paramref name="options"/>.
+    /// </summary>
+    /// <param name="port">Port the channel reads and writes; not disposed by this instance.</param>
+    /// <param name="options">Link behaviour. <see cref="Sk150Options.PortName"/> is not required here.</param>
+    /// <remarks>
+    /// The timeouts are pushed onto the port from <see cref="Sk150Options.ResponseTimeout"/>; the
+    /// port is left closed for the caller (or <see cref="OpenAsync"/>) to open.
+    /// </remarks>
+    /// <exception cref="ArgumentException">Options failed validation.</exception>
+    public SerialRegisterChannel(ISerialPort port, Sk150Options options)
+    {
+        ArgumentNullException.ThrowIfNull(port);
+        ArgumentNullException.ThrowIfNull(options);
+
+        options.Validate();
+        _options = options.Clone();
+        _port = port;
+
+        int timeoutMs = (int)Math.Max(1, _options.ResponseTimeout.TotalMilliseconds);
+        _port.ReadTimeout = timeoutMs;
+        _port.WriteTimeout = timeoutMs;
+    }
+
+    /// <summary>
+    /// Creates a channel that builds its own port through <paramref name="portFactory"/>, keeping
+    /// the full options semantics (including the required <see cref="Sk150Options.PortName"/>).
+    /// </summary>
+    /// <param name="options">Link behaviour; must carry a port name.</param>
+    /// <param name="portFactory">Builds the port implementation to talk through.</param>
+    /// <exception cref="ArgumentException">No port name was supplied, or options failed validation.</exception>
+    public SerialRegisterChannel(Sk150Options options, Func<Sk150Options, ISerialPort> portFactory)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(portFactory);
         if (string.IsNullOrWhiteSpace(options.PortName))
         {
             throw new ArgumentException("Sk150Options.PortName must be set to open a serial link.", nameof(options));
@@ -30,14 +73,12 @@ public sealed class SerialRegisterChannel : IRegisterChannel
 
         options.Validate();
         _options = options.Clone();
-        _port = new SerialPort(_options.PortName!, _options.BaudRate, Parity.None, 8, StopBits.One)
-        {
-            Handshake = Handshake.None,
-            DtrEnable = false,
-            RtsEnable = false,
-            ReadTimeout = (int)Math.Max(1, _options.ResponseTimeout.TotalMilliseconds),
-            WriteTimeout = (int)Math.Max(1, _options.ResponseTimeout.TotalMilliseconds),
-        };
+        _port = portFactory(_options) ?? throw new ArgumentException(
+            "The port factory returned null.", nameof(portFactory));
+
+        int timeoutMs = (int)Math.Max(1, _options.ResponseTimeout.TotalMilliseconds);
+        _port.ReadTimeout = timeoutMs;
+        _port.WriteTimeout = timeoutMs;
     }
 
     /// <summary>Creates a channel for one port, using the family defaults (115200 8N1, slave 1).</summary>
@@ -229,8 +270,8 @@ public sealed class SerialRegisterChannel : IRegisterChannel
             try
             {
                 _port.DiscardInBuffer();
-                await _port.BaseStream.WriteAsync(request, cancellationToken).ConfigureAwait(false);
-                await _port.BaseStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await _port.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+                await _port.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is IOException or InvalidOperationException)
             {
@@ -246,12 +287,13 @@ public sealed class SerialRegisterChannel : IRegisterChannel
     }
 
     /// <remarks>
-    /// Deliberately synchronous and poll-driven: <see cref="Stream.ReadAsync(byte[], int, int, CancellationToken)"/>
-    /// on <see cref="SerialPort.BaseStream"/> is unusable on Windows, because cancelling the pending
-    /// read surfaces as <c>IOException</c> "The I/O operation has been aborted ..." (winerror 995)
-    /// instead of <see cref="OperationCanceledException"/> — which both breaks cancellation and
-    /// leaves the input buffer in an unknown state, so the next parse sees a corrupt frame. Sync
-    /// reads honour <see cref="SerialPort.ReadTimeout"/> and always leave the port consistent.
+    /// Deliberately synchronous and poll-driven. Reading via async stream APIs on a serial port is
+    /// unusable on Windows, because cancelling the pending read surfaces as <c>IOException</c>
+    /// "The I/O operation has been aborted ..." (winerror 995) instead of
+    /// <see cref="OperationCanceledException"/> — which both breaks cancellation and leaves the
+    /// input buffer in an unknown state, so the next parse sees a corrupt frame. A synchronous
+    /// <see cref="ISerialPort.Read"/> honours <see cref="ISerialPort.ReadTimeout"/> and always
+    /// leaves the port consistent.
     /// </remarks>
     private async Task<byte[]> ReadFrameAsync(int expectedLength, CancellationToken cancellationToken)
     {

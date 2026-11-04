@@ -31,20 +31,31 @@ public static class Sk150Discovery
     public static IReadOnlyList<byte> DefaultSlaveAddresses { get; } = [1, 2, 3];
 
     /// <summary>Returns the machine's serial port names, sorted.</summary>
-    public static IReadOnlyList<string> GetPortNames()
-        => SerialPort.GetPortNames().OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+    /// <param name="portNameProvider">
+    /// Where the names come from; defaults to <see cref="SerialPort.GetPortNames"/>. Supplying a
+    /// provider makes discovery testable without touching real hardware.
+    /// </param>
+    public static IReadOnlyList<string> GetPortNames(Func<IEnumerable<string>>? portNameProvider = null)
+        => (portNameProvider?.Invoke() ?? SerialPort.GetPortNames())
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
     /// <summary>Checks one port/baud/slave combination and returns the identity, or null when silent.</summary>
     /// <param name="portName">Serial port to probe.</param>
     /// <param name="baudRate">Link speed to try.</param>
     /// <param name="slaveAddress">Slave address to try.</param>
     /// <param name="responseTimeout">How long to wait for the answer; 300 ms by default.</param>
+    /// <param name="channelFactory">
+    /// Builds the transport to probe through; defaults to a real serial channel. Supplying a
+    /// factory lets a host application reuse its own port implementation.
+    /// </param>
     /// <param name="cancellationToken">Cancels the probe.</param>
     public static async Task<Sk150DeviceInfo?> ProbeAsync(
         string portName,
         int baudRate = 115200,
         byte slaveAddress = 1,
         TimeSpan? responseTimeout = null,
+        Func<Sk150Options, IRegisterChannel>? channelFactory = null,
         CancellationToken cancellationToken = default)
     {
         var options = new Sk150Options
@@ -58,9 +69,9 @@ public static class Sk150Discovery
 
         try
         {
-            await using Sk150PowerSupply psu = await Sk150PowerSupply
-                .OpenAsync(options, cancellationToken)
-                .ConfigureAwait(false);
+            await using Sk150PowerSupply psu = channelFactory is null
+                ? await Sk150PowerSupply.OpenAsync(options, cancellationToken).ConfigureAwait(false)
+                : await OpenOverChannelAsync(options, channelFactory, cancellationToken).ConfigureAwait(false);
             return await psu.ReadDeviceInfoAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is Sk150LinkException or ModbusException or IOException)
@@ -69,18 +80,43 @@ public static class Sk150Discovery
         }
     }
 
+    /// <summary>Opens a facade over a caller-supplied transport, probing once like the serial path.</summary>
+    private static async Task<Sk150PowerSupply> OpenOverChannelAsync(
+        Sk150Options options,
+        Func<Sk150Options, IRegisterChannel> channelFactory,
+        CancellationToken cancellationToken)
+    {
+        IRegisterChannel channel = channelFactory(options);
+        try
+        {
+            await channel.OpenAsync(cancellationToken).ConfigureAwait(false);
+            var psu = new Sk150PowerSupply(channel, options);
+            await psu.ReadStatusAsync(cancellationToken).ConfigureAwait(false);
+            return psu;
+        }
+        catch
+        {
+            await channel.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
     /// <summary>Sweeps ports, baud rates and slave addresses and returns the first device found.</summary>
     /// <param name="ports">Ports to try; defaults to every port on the machine.</param>
     /// <param name="baudRates">Rates to try; defaults to <see cref="DefaultBaudRates"/>.</param>
     /// <param name="slaveAddresses">Addresses to try; defaults to <see cref="DefaultSlaveAddresses"/>.</param>
+    /// <param name="channelFactory">Builds the transport to probe through; defaults to a real serial channel.</param>
+    /// <param name="portNameProvider">Where port names come from when <paramref name="ports"/> is null.</param>
     /// <param name="cancellationToken">Cancels the sweep.</param>
     public static async Task<Sk150ProbeResult?> FindAsync(
         IEnumerable<string>? ports = null,
         IEnumerable<int>? baudRates = null,
         IEnumerable<byte>? slaveAddresses = null,
+        Func<Sk150Options, IRegisterChannel>? channelFactory = null,
+        Func<IEnumerable<string>>? portNameProvider = null,
         CancellationToken cancellationToken = default)
     {
-        IReadOnlyList<string> candidates = ports?.ToArray() ?? GetPortNames();
+        IReadOnlyList<string> candidates = ports?.ToArray() ?? GetPortNames(portNameProvider);
         IReadOnlyList<int> rates = baudRates?.ToArray() ?? DefaultBaudRates;
         IReadOnlyList<byte> addresses = slaveAddresses?.ToArray() ?? DefaultSlaveAddresses;
 
@@ -91,8 +127,8 @@ public static class Sk150Discovery
                 foreach (byte address in addresses)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    Sk150DeviceInfo? device = await ProbeAsync(port, rate, address, null, cancellationToken)
-                        .ConfigureAwait(false);
+                    Sk150DeviceInfo? device = await ProbeAsync(
+                        port, rate, address, null, channelFactory, cancellationToken).ConfigureAwait(false);
                     if (device is not null)
                     {
                         return new Sk150ProbeResult(port, rate, address, device);
