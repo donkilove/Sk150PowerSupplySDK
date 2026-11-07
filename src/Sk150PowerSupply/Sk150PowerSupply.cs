@@ -419,12 +419,22 @@ public sealed class Sk150PowerSupply : IDisposable, IAsyncDisposable
         {
             await _channel.CloseAsync(CancellationToken.None).ConfigureAwait(false);
         }
-        catch (Sk150LinkException)
+        catch (Exception)
         {
-            // A port that disappeared cannot be closed gracefully; disposal still has to finish.
+            // CR-1 SK-05：释放路径**永不外抛**。原实现只捕 Sk150LinkException，
+            // 而 IRegisterChannel 是公开注入点，CloseAsync 可抛 ObjectDisposedException /
+            // InvalidOperationException / ArgumentException —— 它们会穿透并在 finally 中
+            // 替换掉调用方本来要看到的异常。释放失败无可挽回，只记录不抛。
         }
 
-        await _channel.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            await _channel.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // 同上：注入通道的 DisposeAsync 也可能抛；释放路径不得让探测/收尾崩溃。
+        }
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);

@@ -242,4 +242,131 @@ public sealed class Sk150DiscoveryTests
         // 端口不存在 → 内部失败 → 返回 null（而不是把异常抛给调用方）
         Assert.Null(ex);
     }
+
+    // ================= CR-1 SK-01/SK-04/SK-05：异常覆盖与所有权契约 =================
+
+    [Fact]
+    public async Task FindAsync_SingletonFactory_MultipleCandidates_DoesNotThrow()   // SK-01
+    {
+        // 缺陷：FindAsync 对每个候选调一次 ProbeAsync，每次都释放通道。
+        // 若 channelFactory 返回**同一实例**，第二轮拿到已 Disposed 的通道 →
+        // ObjectDisposedException 不在 ProbeAsync:77 的过滤器内 → 冒泡出 FindAsync。
+        // 修复：① ProbeAsync 捕获该异常视为「该候选失败」；② 文档明确「工厂须每次新建」。
+        var channel = new DisposableObservingChannel(MockRegisterChannel.CreateSk150());
+
+        var ex = await Record.ExceptionAsync(async () =>
+            await Sk150Discovery.FindAsync(
+                ports: ["COM1"],
+                baudRates: [115200, 9600],          // 两个候选 → 必然第二轮
+                slaveAddresses: [1],
+                channelFactory: _ => channel));     // 单例工厂
+
+        Assert.Null(ex);   // 修复前：ObjectDisposedException 冒泡
+    }
+
+    [Fact]
+    public async Task ProbeAsync_DisposeThrows_ResultStillDeterminedByRead()   // SK-04
+    {
+        // 缺陷：await using 的 DisposeAsync 异常先于 :77 过滤器发生 →
+        // 若 DisposeAsync 抛 IOException，会命中过滤器 → 返回 null，
+        // 而 ReadDeviceInfoAsync 其实已成功 → FindAsync 会跳过真实在线设备。
+        var channel = new ThrowingOnDisposeChannel(MockRegisterChannel.CreateSk150());
+
+        var info = await Sk150Discovery.ProbeAsync(
+            "COM7", 115200, 1, TimeSpan.FromMilliseconds(50), channelFactory: _ => channel);
+
+        // 设备已应答 ⇒ 必须返回非 null，不能因释放失败而判成"探测失败"
+        Assert.NotNull(info);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_NeverThrows_OnOwnedChannel()   // SK-05
+    {
+        // DisposeAsync 原只 catch Sk150LinkException；注入通道可抛其它类型，
+        // 会穿透并替换调用的原异常。释放路径必须永不外抛。
+        var channel = new ThrowingOnDisposeChannel(MockRegisterChannel.CreateSk150());
+
+        // 直接构造 ownsChannel=true 的门面并释放（internal 构造，同程序集测试可见）
+        var ex = await Record.ExceptionAsync(async () =>
+        {
+            var psu = new Sk150PowerSupply(channel, new Sk150Options(), ownsChannel: true);
+            await psu.DisposeAsync();
+        });
+
+        Assert.Null(ex);   // 修复前：ObjectDisposedException 外抛
+    }
+
+    /// <summary>
+    /// 真实会「Dispose 后不可用」的通道：DisposeAsync 后 OpenAsync 抛 ObjectDisposedException。
+    /// 用于复现「单例工厂 + 多候选」时第二轮撞上已释放通道的路径。
+    /// </summary>
+    private sealed class DisposableObservingChannel(MockRegisterChannel inner) : IRegisterChannel
+    {
+        private bool _disposed;
+
+        public bool IsOpen => !_disposed && inner.IsOpen;
+
+        public async Task OpenAsync(CancellationToken cancellationToken = default)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            await inner.OpenAsync(cancellationToken);
+            // 打开成功但读不到数据：使本轮探测失败，同时通道已进入「打开过」状态
+            inner.QueueTimeouts(int.MaxValue);
+        }
+
+        public Task CloseAsync(CancellationToken cancellationToken = default)
+            => inner.CloseAsync(cancellationToken);
+
+        public async Task<ushort[]> ReadHoldingRegistersAsync(
+            ushort startAddress, ushort count, CancellationToken cancellationToken = default)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return await inner.ReadHoldingRegistersAsync(startAddress, count, cancellationToken);
+        }
+
+        public Task WriteSingleRegisterAsync(
+            ushort address, ushort value, CancellationToken cancellationToken = default)
+            => inner.WriteSingleRegisterAsync(address, value, cancellationToken);
+
+        public Task WriteMultipleRegistersAsync(
+            ushort startAddress, IReadOnlyList<ushort> values, CancellationToken cancellationToken = default)
+            => inner.WriteMultipleRegistersAsync(startAddress, values, cancellationToken);
+
+        public void Dispose() => _disposed = true;
+
+        public ValueTask DisposeAsync()
+        {
+            _disposed = true;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    /// <summary>DisposeAsync 抛非 Sk150LinkException 的通道（模拟注入实现的异常）。</summary>
+    private sealed class ThrowingOnDisposeChannel(MockRegisterChannel inner) : IRegisterChannel
+    {
+        public bool IsOpen => inner.IsOpen;
+
+        public Task OpenAsync(CancellationToken cancellationToken = default) => inner.OpenAsync(cancellationToken);
+
+        public Task CloseAsync(CancellationToken cancellationToken = default)
+            => throw new ObjectDisposedException("simulated close failure");
+
+        public Task<ushort[]> ReadHoldingRegistersAsync(
+            ushort startAddress, ushort count, CancellationToken cancellationToken = default)
+            => inner.ReadHoldingRegistersAsync(startAddress, count, cancellationToken);
+
+        public Task WriteSingleRegisterAsync(
+            ushort address, ushort value, CancellationToken cancellationToken = default)
+            => inner.WriteSingleRegisterAsync(address, value, cancellationToken);
+
+        public Task WriteMultipleRegistersAsync(
+            ushort startAddress, IReadOnlyList<ushort> values, CancellationToken cancellationToken = default)
+            => inner.WriteMultipleRegistersAsync(startAddress, values, cancellationToken);
+
+        public void Dispose()
+        {
+        }
+
+        public ValueTask DisposeAsync() => throw new ObjectDisposedException("simulated dispose failure");
+    }
 }

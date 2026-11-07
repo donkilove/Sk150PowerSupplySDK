@@ -48,6 +48,14 @@ public static class Sk150Discovery
     /// <param name="channelFactory">
     /// Builds the transport to probe through; defaults to a real serial channel. Supplying a
     /// factory lets a host application reuse its own port implementation.
+    ///
+    /// <para><b>CR-1 SK-02 — 所有权契约（重要）</b>：工厂返回的通道**所有权转移给本方法**。
+    /// 探测结束（无论成功或失败）都会 <c>CloseAsync + DisposeAsync</c> 该通道。
+    /// 因此工厂**必须每次调用都返回新实例**——返回同一个单例会让第二次探测撞上已释放的通道
+    /// （虽然已被 SK-01 兜住为「该候选失败」，但那是容错而非正确用法）。</para>
+    ///
+    /// <para>这是相对 0.2.0 的**行为变更**：0.2.0 探测成功后不释放（串口句柄泄漏，SP-01），
+    /// 那时宿主可继续复用同一通道；0.2.1 起探测会接管并销毁，宿主须自行重开。</para>
     /// </param>
     /// <param name="cancellationToken">Cancels the probe.</param>
     public static async Task<Sk150DeviceInfo?> ProbeAsync(
@@ -76,6 +84,13 @@ public static class Sk150Discovery
         }
         catch (Exception ex) when (ex is Sk150LinkException or ModbusException or IOException)
         {
+            return null;
+        }
+        catch (ObjectDisposedException)
+        {
+            // CR-1 SK-01：单例工厂（错误用法）在多候选场景下，第二轮会拿到已释放的通道。
+            // 该异常不在上面的过滤器内，原本会冒泡出 FindAsync 让整个扫描崩掉。
+            // 视为「该候选失败、继续扫下一个」，扫描语义不变（busy/missing/silent 一律 skip）。
             return null;
         }
     }
