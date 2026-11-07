@@ -34,7 +34,13 @@ public sealed class Sk150PowerSupply : IDisposable, IAsyncDisposable
         _ownsChannel = false;
     }
 
-    private Sk150PowerSupply(IRegisterChannel channel, Sk150Options options, bool ownsChannel)
+    /// <summary>
+    /// 内部工厂构造：显式声明是否拥有通道。
+    /// CR-1 SP-01：原为 <c>private</c>，但 <see cref="Sk150Discovery.OpenOverChannelAsync"/> 需要
+    /// 用它造「拥有通道」的门面（公开构造有意为不拥有）。改为 <c>internal</c> —— 仅程序集内可见，
+    /// 不扩张公共 API 面。
+    /// </summary>
+    internal Sk150PowerSupply(IRegisterChannel channel, Sk150Options options, bool ownsChannel)
     {
         _channel = channel;
         _options = options;

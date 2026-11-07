@@ -120,4 +120,126 @@ public sealed class Sk150DiscoveryTests
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
+
+    // ================= CR-1 SP-01：探测注入路径必须释放它自己创建的通道 =================
+    // 缺陷：OpenOverChannelAsync 用**公开构造函数**包门面（_ownsChannel=false），
+    // 而 Sk150PowerSupply.DisposeAsync 在 !_ownsChannel 时直接 return（什么都不释放）。
+    // 于是探测成功后串口句柄永久持有 —— 正是 M83 修过的同一类坑（COM in use，等 GC 终结器）。
+    // 修复：私有构造 + ownsChannel: true（探测语义下门面本就该释放工厂造出的通道）。
+
+    /// <summary>可观测的通道：记录 Open/Close/Dispose 次数，行为同 MockRegisterChannel。</summary>
+    private sealed class ObservingChannel(MockRegisterChannel inner) : IRegisterChannel
+    {
+        public int OpenCount { get; private set; }
+
+        public int CloseCount { get; private set; }
+
+        public int DisposeCount { get; private set; }
+
+        public bool IsOpen => inner.IsOpen;
+
+        /// <summary>转发到内层的超时注入（模拟线路静默）。</summary>
+        public void QueueTimeouts(int count) => inner.QueueTimeouts(count);
+
+        public Task OpenAsync(CancellationToken cancellationToken = default)
+        {
+            OpenCount++;
+            return inner.OpenAsync(cancellationToken);
+        }
+
+        public Task CloseAsync(CancellationToken cancellationToken = default)
+        {
+            CloseCount++;
+            return inner.CloseAsync(cancellationToken);
+        }
+
+        public Task<ushort[]> ReadHoldingRegistersAsync(
+            ushort startAddress,
+            ushort count,
+            CancellationToken cancellationToken = default)
+            => inner.ReadHoldingRegistersAsync(startAddress, count, cancellationToken);
+
+        public Task WriteSingleRegisterAsync(
+            ushort address,
+            ushort value,
+            CancellationToken cancellationToken = default)
+            => inner.WriteSingleRegisterAsync(address, value, cancellationToken);
+
+        public Task WriteMultipleRegistersAsync(
+            ushort startAddress,
+            IReadOnlyList<ushort> values,
+            CancellationToken cancellationToken = default)
+            => inner.WriteMultipleRegistersAsync(startAddress, values, cancellationToken);
+
+        public void Dispose() => DisposeCount++;
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCount++;
+            return inner.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ProbeAsync_WithChannelFactory_DisposesTheChannelItCreated()   // SP-01 AC-1
+    {
+        var channel = new ObservingChannel(MockRegisterChannel.CreateSk150());
+
+        Sk150DeviceInfo? info = await Sk150Discovery.ProbeAsync(
+            "COM7",
+            115200,
+            1,
+            responseTimeout: TimeSpan.FromMilliseconds(50),
+            channelFactory: _ => channel);
+
+        Assert.NotNull(info);                 // 探测成功
+        Assert.Equal(1, channel.OpenCount);
+        Assert.Equal(1, channel.DisposeCount);   // ← 修复前是 0（句柄泄漏）
+    }
+
+    [Fact]
+    public async Task FindAsync_WithChannelFactory_DisposesTheChannelItHit()   // SP-01 AC-2
+    {
+        var channel = new ObservingChannel(MockRegisterChannel.CreateSk150());
+
+        Sk150ProbeResult? hit = await Sk150Discovery.FindAsync(
+            ports: ["COM1"],
+            baudRates: [115200],
+            slaveAddresses: [1],
+            channelFactory: _ => channel);
+
+        Assert.NotNull(hit);
+        Assert.Equal(1, channel.DisposeCount);   // ← 修复前是 0
+    }
+
+    [Fact]
+    public async Task ProbeAsync_WithChannelFactory_FailureStillDisposesChannel()   // SP-01 AC-3（不回归）
+    {
+        // 探测失败路径：现有 catch 里的 channel.DisposeAsync() 必须仍然生效
+        var channel = new ObservingChannel(MockRegisterChannel.CreateSk150());
+        channel.QueueTimeouts(int.MaxValue);
+
+        Sk150DeviceInfo? info = await Sk150Discovery.ProbeAsync(
+            "COM7",
+            115200,
+            1,
+            responseTimeout: TimeSpan.FromMilliseconds(20),
+            channelFactory: _ => channel);
+
+        Assert.Null(info);
+        Assert.Equal(1, channel.DisposeCount);   // 失败路径本就该释放
+    }
+
+    [Fact]
+    public async Task ProbeAsync_WithoutChannelFactory_StillWorks()   // SP-01 AC-4 不回归
+    {
+        // 不注入工厂时走 OpenAsync（既有路径），行为不变——用判决性弱的断言锁"不抛算术异常"
+        // 真实串口不可用，故此处只验证"没有工厂时不因构造参数变化而崩溃"。
+        var ex = await Record.ExceptionAsync(async () =>
+            await Sk150Discovery.ProbeAsync(
+                "COM_DOES_NOT_EXIST", 115200, 1, TimeSpan.FromMilliseconds(20)));
+
+        // 端口不存在 → 内部失败 → 返回 null（而不是把异常抛给调用方）
+        Assert.Null(ex);
+    }
 }

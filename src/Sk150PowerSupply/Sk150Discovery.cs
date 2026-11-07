@@ -81,6 +81,14 @@ public static class Sk150Discovery
     }
 
     /// <summary>Opens a facade over a caller-supplied transport, probing once like the serial path.</summary>
+    /// <remarks>
+    /// CR-1 SP-01：门面**必须拥有**它自己创建的通道。原实现用公开构造函数
+    /// <c>new Sk150PowerSupply(channel, options)</c>（该重载有意置 <c>_ownsChannel=false</c>），
+    /// 于是 <see cref="Sk150PowerSupply.DisposeAsync"/> 在 <c>!_ownsChannel</c> 时直接返回、
+    /// 什么都不释放 —— 探测成功后串口句柄被永久持有（现场表现为 <c>COMx in use</c>，要等 GC
+    /// 终结器回收才恢复，与 M83 修过的是同一类坑）。探测语义下门面本就该释放工厂造出的通道，
+    /// 故改用私有构造并显式 <c>ownsChannel: true</c>。
+    /// </remarks>
     private static async Task<Sk150PowerSupply> OpenOverChannelAsync(
         Sk150Options options,
         Func<Sk150Options, IRegisterChannel> channelFactory,
@@ -90,7 +98,7 @@ public static class Sk150Discovery
         try
         {
             await channel.OpenAsync(cancellationToken).ConfigureAwait(false);
-            var psu = new Sk150PowerSupply(channel, options);
+            var psu = new Sk150PowerSupply(channel, options, ownsChannel: true);
             await psu.ReadStatusAsync(cancellationToken).ConfigureAwait(false);
             return psu;
         }
