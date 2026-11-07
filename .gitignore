@@ -22,3 +22,6 @@ TestResults/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 测试运行时 TEMP 重定向目录
+.tmp/
